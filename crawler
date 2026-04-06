@@ -42,7 +42,7 @@ class Crawler:
         # build the request
         request = f"{method} {path} HTTP/1.1\r\n"
         request += f"Host: {self.server}\r\n"
-        request += "User-Agent: Crawler/1.0\r\n"
+        request += "User-Agent: MyCrawler/1.0\r\n"
         request += "Connection: close\r\n"
 
         # add components of the request body data
@@ -76,16 +76,16 @@ class Crawler:
                     response += data
 
         # split header and body
-        headers, body = response.split(b"\r\n\r\n", 1)
-        headers_text = headers.decode()
+        response_headers, response_body = response.split(b"\r\n\r\n", 1)
+        headers_text = response_headers.decode()
 
         # extract the status code
         status_code = headers_text.split("\r\n")[0]
         if '503' in status_code:
-            self.send_request(path, method, body, headers)
+            return self.send_request(path, method, body, headers)
 
-        return headers_text, body.decode()
-    
+        return headers_text, response_body.decode()
+
     """Helper function to extract the CSRF token from the login page."""
     def extract_csrf_token(self, html):
         start_index = html.find('name="csrfmiddlewaretoken" value="')
@@ -99,13 +99,21 @@ class Crawler:
         return token
     
     def get_csrf_token(self):
-        headers_text, html = self.send_request("/accounts/login")
+        headers_text, html = self.send_request("/accounts/login/")
+        print("LOGIN GET STATUS:", headers_text.split("\r\n")[0])
+        print("CSRF TOKEN:", self.csrf_token)
+        print("COOKIE:", self.cookie)
 
         if headers_text is None or html is None:
             return None
 
-        return self.extract_csrf_token(html)
-    
+        self.csrf_token = self.extract_csrf_token(html)
+
+        # get csrf token from Set-Cookie header using regex
+        match = re.search(r"csrftoken=([a-zA-Z0-9]+)", headers_text)
+        if match: 
+            self.cookie = match.group(1)
+
     '''
     Method that sends a POST request to the login form page with the username and password
     and obtains a new cookie and the session id
@@ -119,31 +127,23 @@ class Crawler:
 
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
-            "Content-Length": str(len(post_data)),
-            "Referer": f"https://{self.server}:{self.port}/accounts/login/?next=/fakebook/",
+            "Referrer": f"https://{self.server}:{self.port}/accounts/login/?next=/fakebook/",
             "Cookie": f"csrftoken={self.cookie}",
             "Origin": f"https://{self.server}"
         }
 
         headers_text, response_body = self.send_request("/accounts/login/?next=/fakebook/", method="POST", body=post_data, headers=headers)
 
-        # search for string literal "csrftoken=" in the response headers to extract the new cookie
-        cookie_index = headers_text.find("csrftoken=")
-        if cookie_index == -1:
-            print("Failed to find cookie in response headers")
-            return None
-        cookie_start = cookie_index + len("csrftoken=")
-        cookie_end = headers_text.find(";", cookie_start)
-        self.cookie = headers_text[cookie_start:cookie_end]
+        match = re.search(r"csrftoken=([a-zA-Z0-9]+)", headers_text)
+        if match: # If found, replace the old value in the instance variable
+            self.cookie = match.group(1)
 
-        # search for string literal "sessionid=" in the response headers to extract the session id
-        session_id_index = headers_text.find("sessionid=")
-        if session_id_index == -1:
-            print("Failed to find session id in response headers")
-            return None
-        session_id_start = session_id_index + len("sessionid=")
-        session_id_end = headers_text.find(";", session_id_start)
-        self.session_id = headers_text[session_id_start:session_id_end]
+        # Using regex, search for string literal "sessionid=" and use ([a-zA-Z0-9]+) to get alphanumeric results
+        match = re.search(r"sessionid=([a-zA-Z0-9]+)", headers_text)
+        if match: # If found, store it in the instance variable
+            self.session_id = match.group(1)
+        print("headers text", headers_text)
+        
 
     def crawl(self, link):
         post_body = urllib.parse.urlencode({
@@ -155,7 +155,7 @@ class Crawler:
             "Cookie": f"csrftoken={self.cookie}; sessionid={self.session_id}",
         }
 
-        headers, body = self.send_request(link, method="POST", body=post_body, headers=headers)
+        headers, body = self.send_request(link, headers=headers)
 
         # find the secret flag in the body of the response
         flags = re.findall(r"<h3 class='secret_flag' style=\"color:red\">FLAG: ([a-zA-Z0-9]{64})</h3>", body)
@@ -194,8 +194,9 @@ class Crawler:
         # log in to the server to obtain a new cookie and session id
         self.login()
 
-        # access the homepage to start crawling
-        self.crawl("/fakebook/")
+        # add /fakebook/ to the queue to start crawling
+        self.queue.append("/fakebook/")
+        self.visited_links.add("/fakebook/")
 
         # keep crawling until there are no more links in the queue
         while self.queue and len(self.secret_flags) < 5:

@@ -1,0 +1,261 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse
+import re
+import socket
+import ssl
+import urllib.parse
+import zlib
+from html.parser import HTMLParser
+from collections import deque
+
+'''
+This class implements an HTML Parser
+'''
+class MyParser(HTMLParser):
+    '''
+    init method that defines and resets the "links" field, which is used to store the parsed out links for 
+    easy access
+    '''
+    def __init__(self):
+        super().__init__()
+        self.links = []
+
+    '''
+    Inherited method from HTMLParser superclass, indicates which tags to specifically search for.
+    In this instance, links, which fall under the tag "a" and attribute "href". Furthermore, it
+    specifically looks for links that start with "/fakebook" to avoid including the Home link or the logout
+    Parameters:
+        tag: the JavaScript tag
+        attrs: the JavaScript attribute
+    '''
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            for attr, value in attrs:
+                if attr == "href" and value.startswith("/fakebook"):
+                    self.links.append(value)
+
+# The default values for if no server or port is provided in the command line.
+DEFAULT_SERVER = "fakebook.khoury.northeastern.edu"
+DEFAULT_PORT = 443
+
+'''
+Main class that represents a web crawler.
+Fields include server, port, username, password, the derived csrfmiddleware token, the csrf cookie, session id.
+There are also supporting variables to make the crawling more efficient and avoid loops: visited_links and queue.
+The secret flags themselves are stored in secret_flags.
+'''
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        self.csrf_token = None
+        self.cookie = None
+        self.session_id = None
+        self.visited_links = set() # A set is used to avoid duplicates
+        self.queue = deque() # A deque is used to implement BFS when iterating through the links
+        self.secret_flags = []
+
+    '''
+    This method handles all requests
+    Parameters:
+        path: The route of the request (e.g. /fakebook/)
+        method: Either POST or GET, GET by default since POST is only used once in order to log-in
+        data: The information that is stored in the request's body, such as username, password, csrfmiddlewaretoken
+        headers: The information that is stored in the request's headers, such as csrftoken and session id
+    '''
+    def send_request(self, path, method="GET", data=None, headers={}):
+        # Building the request
+        request = f"{method} {path} HTTP/1.1\r\n"
+        request += f"Host: {self.server}\r\n"
+        request += f"User-Agent: MyCrawler/1.0\r\n"
+        request += f"Connection: close\r\n"
+
+        # Components of the request body data
+        if data:
+            headers["Content-Length"] = str(len(data))
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+        # Proper formatting for the headers
+        for key, value in headers.items():
+            request += f"{key}: {value}\r\n"
+
+        request += "\r\n"
+
+        if data:
+            request += data
+
+        # Create socket and wrap with SSL
+        context = ssl.create_default_context()
+        with socket.create_connection((self.server, self.port)) as sock:
+            with context.wrap_socket(sock, server_hostname=self.server) as ssock:
+                ssock.sendall(request.encode("ascii"))
+
+                # Read response in chunks since it's HTTP 1.1
+                response = b""
+                while True:
+                    chunk = ssock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+
+        # Split headers and body
+        response_headers, body = response.split(b"\r\n\r\n", 1)
+        headers_text = response_headers.decode()
+
+        # Handle gzip compression if needed
+        if b"Content-Encoding: gzip" in response_headers:
+            body = zlib.decompress(body, zlib.MAX_WBITS | 16)
+
+        # Extract the status line
+        status_line = headers_text.split("\r\n")[0]
+        if '503 CS3700' in status_line: # If a 503 error is encountered, keep trying until it works
+            self.send_request(path, method, data, headers)
+
+        return headers_text, body.decode("utf-8", errors="ignore")
+    
+    '''
+    Helper method that takes in html and finds the csrfmiddleware token
+    Parameters:
+        html: The html that is returned by the GET requests
+    '''
+    def extract_csrf_token(self, html):
+        start_index = html.find('name="csrfmiddlewaretoken" value="')
+
+        if start_index == -1:
+            return None
+
+        start_index += len('name="csrfmiddlewaretoken" value="')
+        end_index = html.find('"', start_index)
+        token = html[start_index:end_index]
+        return token
+    
+    '''
+    Method that queries the login form page and obtains the csrfmiddlewaretoken and the csrftoken using regex
+    '''
+    def get_csrf_token(self):
+        # Sends a GET request to the login page to obtain the headers and the html
+        headers_text, html = self.send_request("/accounts/login/")
+
+        # Extract CSRF middleware token from HTML and store it in the instance variable
+        self.csrf_token = self.extract_csrf_token(html)
+
+        # Extract CSRF token from Set-Cookie header using regex
+        # Here, we search for the string literal "csrftoken=" in the headers, 
+        # and the ([a-zA-Z0-9]+) grabs everything alphanumeric after it
+        match = re.search(r"csrftoken=([a-zA-Z0-9]+)", headers_text)
+        if match: # If it's found, store it in the instance variable
+            self.cookie = match.group(1)
+
+    '''
+    Method that sends a POST request to the login form page with the important information and obtains the 
+    new cookie and the session id using regex, which are used for future queries
+    '''
+    def login(self):
+        # Set up the body data with username, password, and csrfmiddlewaretoken
+        post_data = urllib.parse.urlencode({
+            "username": self.username,
+            "password": self.password,
+            "csrfmiddlewaretoken": self.csrf_token
+        })
+
+        # Include the csrf cookie under the Cookie header
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": f"https://{self.server}:{self.port}/accounts/login/?next=/fakebook/",
+            "Cookie": f"csrftoken={self.cookie}",
+            "Origin": f"https://{self.server}"
+        }
+
+        # We don't need the body, so only obtain the headers from the response of the login page for the data,
+        # which includes the new cookie and session id
+        headers_text, _ = self.send_request("/accounts/login/?next=/fakebook/", method="POST", data=post_data, headers=headers)
+        
+        # Using regex, search for string literal "csrftoken=" and use ([a-zA-Z0-9]+) to get alphanumeric results
+        match = re.search(r"csrftoken=([a-zA-Z0-9]+)", headers_text)
+        if match: # If found, replace the old value in the instance variable
+            self.cookie = match.group(1)
+
+        # Using regex, search for string literal "sessionid=" and use ([a-zA-Z0-9]+) to get alphanumeric results
+        match = re.search(r"sessionid=([a-zA-Z0-9]+)", headers_text)
+        if match: # If found, store it in the instance variable
+            self.session_id = match.group(1)
+
+    '''
+    Method used to access the inputted link and then iterate through the links on that page 
+    and check for secret flags
+    Parameters:
+        link: The link that we next want to access and iterate through (e.g. /fakebook/731770779/)
+    '''
+    def crawl_link(self, link):
+        # We need to include the csrfmiddleware token for all queries
+        post_data = urllib.parse.urlencode({
+            "csrfmiddlewaretoken": self.csrf_token
+        })
+
+        # We need to include the csrftoken and sessionid for all queries
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Cookie": f"csrftoken={self.cookie}; sessionid={self.session_id}"
+        }
+
+        # We only need the body to check for secret flags and find new links
+        _, body = self.send_request(f"{link}", data=post_data, headers=headers)
+
+        # Using regex, search for the secret flag in the body
+        # This expression searches for a <h3> element where class="secret_flag" and style="color:red"
+        # ([a-zA-Z0-9]{64}) finds alphanumeric sequences after "FLAG: " that are specifically 64 characters long
+        match = re.search(r'<h3 class=["\']secret_flag["\'] style=["\']color:red["\']>FLAG: ([a-zA-Z0-9]{64})</h3>', body)
+        if match: # If found, add it to the instance variable secret_flags
+            flag = match.group(1)
+            if flag not in self.secret_flags:
+                self.secret_flags.append(flag)
+
+        # Initialize a MyParser object to handle the iterating logic
+        # By initializing it here it also resets the links field
+        parser = MyParser()
+
+        # Populates the parser.links field with all of the links it finds
+        parser.feed(body)
+
+        # For every link in the field, if it's not already been visited, add it to the queue and update visited_links
+        for new_link in parser.links:
+            if new_link not in self.visited_links:
+                self.visited_links.add(new_link)
+                self.queue.append(new_link)
+
+    '''
+    The main function that controls everything
+    '''
+    def run(self):
+        # First extract the information to allow logging in and future queries
+        self.get_csrf_token()
+
+        # Actually login and allow access to Fakebook
+        self.login()
+
+        # First access the homepage and populate the fields
+        self.crawl_link("/fakebook/")
+        
+        # As long as self.queue (there are still links left to traverse) and we haven't yet found all 5 secret flags,
+        # continue to iterate and crawl
+        while self.queue and len(self.secret_flags) < 5:
+            link = self.queue.popleft()  # BFS: Pop from the front of the queue
+            self.crawl_link(link)
+
+        # Once all 5 secret flags are found, print them out, one in each row
+        for flag in self.secret_flags:
+            print(flag)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+
+    sender = Crawler(args)
+    sender.run()
