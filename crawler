@@ -158,7 +158,7 @@ class Crawler:
         headers, body = self.send_request(link, headers=headers)
 
         # find the secret flag in the body of the response
-        flags = re.findall(r"<h3 class='secret_flag' style=\"color:red\">FLAG: ([a-zA-Z0-9]{64})</h3>", body)
+        flags = re.findall(r"<h3 class=\"secret_flag\" style=\"color:red\">FLAG: ([a-zA-Z0-9]{64})</h3>", body)
         for flag in flags:
             self.secret_flags.add(flag)
 
