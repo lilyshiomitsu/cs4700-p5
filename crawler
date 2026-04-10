@@ -11,6 +11,7 @@ import urllib.parse
 DEFAULT_SERVER = "fakebook.khoury.northeastern.edu"
 DEFAULT_PORT = 443
 
+"""Helper class to parse the HTML response and extract links to crawl."""
 class LinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -38,6 +39,7 @@ class Crawler:
         self.queue = deque() # used to implement breadth-first search
         self.secret_flags = set()
 
+    """Method that sends an HTTP request to the server and returns the response."""
     def send_request(self, path, method="GET", body=None, headers={}):
         # build the request
         request = f"{method} {path} HTTP/1.1\r\n"
@@ -96,6 +98,7 @@ class Crawler:
         token = html[start_index:end_index]
         return token
     
+    """Method that sends a GET request to the login page and extracts the CSRF token from the response."""
     def get_csrf_token(self):
         headers_text, html = self.send_request("/accounts/login/")
         if headers_text is None or html is None:
@@ -163,22 +166,6 @@ class Crawler:
             if link not in self.visited_links:
                 self.queue.append(link)
                 self.visited_links.add(link)
-
-    # def run(self):
-    #     request = "GET / HTTP/1.0\r\n\r\n"
-
-    #     print("Request to %s:%d" % (self.server, self.port))
-    #     print(request)
-    #     mysocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    #     mysocket.connect((self.server, self.port))
-    #     mysocket.send(request.encode('ascii'))
-
-    #     data = mysocket.recv(1000)
-    #     # if length of data is zero, the server has closed the connection
-    #     if len(data) == 0:
-    #         print("Response:\nSocket closed by %s" % self.server)
-    #     else:
-    #         print("Response:\n%s" % data.decode('ascii'))
 
     def run(self):
         # extract the CSRF token from the login page
